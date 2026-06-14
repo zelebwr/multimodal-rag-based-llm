@@ -742,7 +742,7 @@ _eval_df = pd.read_csv(CFG["DATASET_DIR"] / CFG["EVAL_CSV"])
 print(f"[EVAL] CSV loaded: {len(_eval_df)} rows | Columns: {list(_eval_df.columns)}")
 
 # Validate required columns
-_required_cols = {"question", "ground_truth"}
+_required_cols = {"user_input", "reference", "expected_reference"}
 if not _required_cols.issubset(_eval_df.columns):
     raise ValueError(
         f"[EVAL] CSV schema error. Expected columns: {_required_cols}. "
@@ -761,7 +761,7 @@ print(f"[EVAL] Running evaluation on {len(_eval_queries)} queries.")
 _eval_results: list[GenerationResult] = []
 
 for row in tqdm(_eval_queries, desc="[EVAL] Pipeline inference"):
-    res = generate(row["question"])
+    res = generate(row["user_input"])
     log_telemetry(res)
     _eval_results.append(res)
 
@@ -794,7 +794,7 @@ for row, res in zip(_eval_queries, _eval_results):
     _ragas_data["question"].append(res.query)
     _ragas_data["answer"].append(res.answer)
     _ragas_data["contexts"].append([c.content for c in res.retrieval_result.chunks])
-    _ragas_data["ground_truth"].append(row["ground_truth"])
+    _ragas_data["ground_truth"].append(row["reference"])
 
 _ragas_dataset = HFDataset.from_dict(_ragas_data)
 
@@ -831,6 +831,33 @@ print(RAGAS_RESULTS_DF[[
     "faithfulness", "answer_relevancy", "context_precision", "context_recall"
 ]].describe())
 
+# -----------------------------------------------------------------------------
+# CELL 8.5 — Source provenance Validator 
+# MECHANISM: parse expected_reference "filename; imageN.png; section; ..."
+# → extract expected filename → check if it appears in res.retrieval_result.sources
+# OUTCOME: per-query bool hit/miss + aggregate hit_rate → source recall proxy
+# -----------------------------------------------------------------------------
+
+def _parse_expected_source(expected_ref: str) -> str:
+    # expected_reference always leads with filename before first semicolon
+    return expected_ref.split(";")[0].strip()
+
+PROVENANCE_RESULTS: list[dict] = []
+
+for row, res in zip(_eval_queries, _eval_results):
+    expected_src   = _parse_expected_source(row["expected_reference"])
+    retrieved_srcs = res.retrieval_result.sources
+    # Case-insensitive match — filenames in CSV may differ in casing vs disk
+    hit = any(expected_src.lower() in s.lower() for s in retrieved_srcs)
+    PROVENANCE_RESULTS.append({
+        "query":          row["user_input"],
+        "expected_src":   expected_src,
+        "retrieved_srcs": retrieved_srcs,
+        "provenance_hit": hit,
+    })
+
+_hit_rate = sum(r["provenance_hit"] for r in PROVENANCE_RESULTS) / len(PROVENANCE_RESULTS)
+print(f"[PROVENANCE] Source hit rate: {_hit_rate:.2%} ({sum(r['provenance_hit'] for r in PROVENANCE_RESULTS)}/{len(PROVENANCE_RESULTS)})")
 
 # =============================================================================
 # ██████████████████████████████████████████████████████████████████████████
@@ -902,9 +929,10 @@ for row, res in tqdm(
 ):
     _prompt = _JUDGE_PROMPT_TEMPLATE.format(
         query        = res.query,
-        ground_truth = row["ground_truth"],
+        ground_truth = row["reference"],
         context      = res.context_block[:4000],  # truncate to avoid judge token overflow
         answer       = res.answer,
+        context      = f"{res.context_block[:3800]}\n\n[EXPECTED SOURCE: {row['expected_reference']}]",
     )
 
     try:
